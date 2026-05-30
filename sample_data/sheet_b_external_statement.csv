@@ -1,0 +1,10 @@
+Transaction Date,Ref,Party,Narration,Amount,Type
+2026-01-02,INV1001,Acme Supplies Pvt Ltd,Office equipment,-12500,Debit
+2026-01-03,INV-1002,Northwind Traders,Customer payment,78500,Credit
+2026-01-05,UPI-8842,Ravi K,Refund,-2500,Debit
+2026-01-07,INV-1003,Zenith Logistics,Freight settlement,-42500,Debit
+2026-01-08,INV-1004,BluePeak Services,Consulting fee,65000,Credit
+2026-01-10,INV-1005,Orion Retail,POS settlement,92000,Credit
+2026-01-11,INV-1006,Delta Power,Electricity bill,-18100,Debit
+2026-01-13,INV-2001,Atlas Imports,Vendor advance,-30000,Debit
+2026-01-15,INV-3001,Helios Capital,Large credit,150000,Credit
