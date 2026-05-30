@@ -8,11 +8,24 @@ from rapidfuzz import fuzz
 from sklearn.ensemble import IsolationForest
 
 from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
 from langchain_community.vectorstores import FAISS
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_core.prompts import PromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
+
+from google import genai
+
+GEMINI_EMBEDDING_MODELS = (
+    "gemini-embedding-001",
+    "models/gemini-embedding-001",
+)
+GEMINI_CHAT_MODELS = (
+    "gemini-2.0-flash",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+)
 
 # --- Configurations & Defaults ---
 st.set_page_config(page_title="Reconciliation Agent", layout="wide")
@@ -391,19 +404,82 @@ def _format_retrieved_docs(docs: list[Document]) -> str:
     return "\n\n---\n\n".join(doc.page_content for doc in docs)
 
 
+class GeminiGenAIEmbeddings(Embeddings):
+    """Embeddings via the current google-genai SDK (avoids deprecated v1beta model names)."""
+
+    def __init__(self, api_key: str, model: str = "gemini-embedding-001"):
+        self.client = genai.Client(api_key=api_key)
+        self.model = model
+
+    def _embed_batch(self, texts: list[str]) -> list[list[float]]:
+        response = self.client.models.embed_content(model=self.model, contents=texts)
+        if not response.embeddings:
+            raise ValueError(f"No embeddings returned for model {self.model}")
+        return [list(item.values) for item in response.embeddings]
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        vectors: list[list[float]] = []
+        batch_size = 100
+        for start in range(0, len(texts), batch_size):
+            vectors.extend(self._embed_batch(texts[start : start + batch_size]))
+        return vectors
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._embed_batch([text])[0]
+
+
+def build_embeddings(api_key: str) -> Embeddings:
+    errors: list[str] = []
+    for model in GEMINI_EMBEDDING_MODELS:
+        try:
+            embeddings = GeminiGenAIEmbeddings(api_key=api_key, model=model)
+            embeddings.embed_query("connectivity check")
+            return embeddings
+        except Exception as exc:
+            errors.append(f"{model}: {exc}")
+
+    for model in GEMINI_EMBEDDING_MODELS:
+        try:
+            embeddings = GoogleGenerativeAIEmbeddings(model=model, google_api_key=api_key)
+            embeddings.embed_query("connectivity check")
+            return embeddings
+        except Exception as exc:
+            errors.append(f"langchain/{model}: {exc}")
+
+    raise RuntimeError(
+        "Could not initialize Gemini embeddings. Tried: "
+        + "; ".join(errors)
+    )
+
+
+def build_chat_model(api_key: str) -> ChatGoogleGenerativeAI:
+    errors: list[str] = []
+    for model in GEMINI_CHAT_MODELS:
+        try:
+            return ChatGoogleGenerativeAI(
+                model=model,
+                google_api_key=api_key,
+                temperature=0.2,
+            )
+        except Exception as exc:
+            errors.append(f"{model}: {exc}")
+    raise RuntimeError(
+        "Could not initialize Gemini chat model. Tried: "
+        + "; ".join(errors)
+    )
+
+
 def initialize_vector_store(api_key: str, docs: list[Document]) -> FAISS:
     if not docs:
         raise ValueError("No documents to index. Chunking produced zero documents.")
-    embeddings = GoogleGenerativeAIEmbeddings(
-        model="models/embedding-001",
-        google_api_key=api_key,
-        task_type="RETRIEVAL_DOCUMENT",
-    )
+    embeddings = build_embeddings(api_key)
     return FAISS.from_documents(docs, embeddings)
 
 
 def ask_rag_agent(question: str, vectorstore: FAISS, api_key: str) -> str:
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=api_key, temperature=0.2)
+    llm = build_chat_model(api_key)
     retriever = vectorstore.as_retriever(search_kwargs={"k": 8})
 
     template = """You are a financial transaction reconciliation assistant.
@@ -452,38 +528,35 @@ def main():
         if not file_a or not file_b:
             st.error("Please upload both sheets.")
             return
-        if not api_key:
-            st.error("Please provide a Gemini API Key to initialize the RAG embeddings.")
-            return
-            
+
         with st.spinner("Processing sheets..."):
             try:
                 sheet_a = load_sheet(file_a, "Sheet A")
                 sheet_b = load_sheet(file_b, "Sheet B")
                 recon_results = reconcile(sheet_a, sheet_b)
-
-                docs = build_langchain_documents(sheet_a, sheet_b, recon_results)
-                st.write(f"RAG documents prepared: {len(docs)}")
-
-                vectorstore = initialize_vector_store(api_key, docs)
-                st.write("FAISS created successfully")
-
-                sample_hits = vectorstore.similarity_search("missing transactions", k=3)
-                with st.expander("RAG retrieval check (sample)", expanded=False):
-                    st.write(sample_hits)
-
-                st.session_state.reconciliation = recon_results
-                st.session_state.vectorstore = vectorstore
-                st.session_state.vector_store = vectorstore
-                st.success(
-                    f"Reconciliation complete. Indexed {len(docs)} chunks; "
-                    f"retriever returned {len(sample_hits)} sample hits."
-                )
             except Exception as e:
-                st.session_state.reconciliation = None
+                st.error(f"Error during reconciliation: {e}")
+                return
+
+            st.session_state.reconciliation = recon_results
+            st.success("Reconciliation complete.")
+
+            if not api_key:
                 st.session_state.vectorstore = None
                 st.session_state.vector_store = None
-                st.error(f"Error during reconciliation: {e}")
+                st.info("Add a Gemini API key and click Reconcile again to enable Agent Consultation.")
+                return
+
+            try:
+                docs = build_langchain_documents(sheet_a, sheet_b, recon_results)
+                vectorstore = initialize_vector_store(api_key, docs)
+                st.session_state.vectorstore = vectorstore
+                st.session_state.vector_store = vectorstore
+                st.success(f"Agent index ready ({len(docs)} evidence chunks).")
+            except Exception as e:
+                st.session_state.vectorstore = None
+                st.session_state.vector_store = None
+                st.warning(f"Agent search unavailable: {e}")
                 
     if st.session_state.reconciliation:
         recon = st.session_state.reconciliation
