@@ -323,7 +323,7 @@ def build_langchain_documents(sheet_a: pd.DataFrame, sheet_b: pd.DataFrame, reco
     return docs
 
 def initialize_vector_store(api_key: str, docs: list[Document]):
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004", google_api_key=api_key)
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=api_key)
     vectorstore = FAISS.from_documents(docs, embeddings)
     return vectorstore
 
