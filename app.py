@@ -299,57 +299,131 @@ def reconcile(sheet_a: pd.DataFrame, sheet_b: pd.DataFrame) -> dict:
     }
 
 # --- RAG Setup (LangChain + FAISS) ---
+def _row_chunk_text(row: dict) -> str:
+    return (
+        f"Transaction ID: {row['transaction_id']}\n"
+        f"Sheet: {row['sheet']}\n"
+        f"Row: {row['row_number']}\n"
+        f"Status: Transaction row\n"
+        f"Date: {row['date']}\n"
+        f"Reference: {row['reference']}\n"
+        f"Party: {row['counterparty'] or row['description']}\n"
+        f"Amount: {row['amount']}\n"
+        f"Direction: {row['direction']}"
+    )
+
+
+def _finding_chunk_text(kind: str, item: dict) -> str:
+    if kind == "matched":
+        return (
+            f"Transaction ID: {item['sheet_a_id']} / {item['sheet_b_id']}\n"
+            f"Row: {item['sheet_a_row']} / {item['sheet_b_row']}\n"
+            f"Status: Matched\n"
+            f"Amount A: {item['amount_a']}\n"
+            f"Amount B: {item['amount_b']}\n"
+            f"Match confidence: {item['confidence']}\n"
+            f"Match reasons: {item['match_reasons']}"
+        )
+    if kind == "mismatched":
+        return (
+            f"Transaction ID: {item['sheet_a_id']} / {item['sheet_b_id']}\n"
+            f"Row: {item['sheet_a_row']} / {item['sheet_b_row']}\n"
+            f"Status: Mismatch\n"
+            f"Amount A: {item['amount_a']}\n"
+            f"Amount B: {item['amount_b']}\n"
+            f"Amount Difference: {item['variance']}\n"
+            f"Needs manual review: {item['needs_review']}"
+        )
+    if kind in {"missing_in_a", "missing_in_b"}:
+        return (
+            f"Transaction ID: {item['transaction_id']}\n"
+            f"Sheet: {item['sheet']}\n"
+            f"Row: {item['row_number']}\n"
+            f"Status: Missing in {'A' if kind == 'missing_in_a' else 'B'}\n"
+            f"Date: {item['date']}\n"
+            f"Reference: {item['reference']}\n"
+            f"Party: {item['counterparty'] or item['description']}\n"
+            f"Amount: {item['amount']}"
+        )
+    if kind == "suspicious":
+        return (
+            f"Transaction ID: {item.get('transaction_id', 'N/A')}\n"
+            f"Sheet: {item.get('sheet', 'N/A')}\n"
+            f"Row: {item.get('row_number', 'N/A')}\n"
+            f"Status: Suspicious / manual review\n"
+            f"Flags: {item.get('flags', '')}\n"
+            f"Needs manual review: {item.get('needs_review', True)}"
+        )
+    return f"Status: {kind}\n{item}"
+
+
 def build_langchain_documents(sheet_a: pd.DataFrame, sheet_b: pd.DataFrame, reconciliation: dict) -> list[Document]:
     docs = []
-    
+
     for row in sheet_a.to_dict("records"):
-        text = f"{row['transaction_id']} from {row['sheet']} row {row['row_number']}: date {row['date']}, reference {row['reference']}, party {row['counterparty'] or row['description']}, amount {row['amount']}, direction {row['direction']}."
-        docs.append(Document(page_content=text, metadata=row))
-        
+        docs.append(Document(page_content=_row_chunk_text(row), metadata={k: str(v) for k, v in row.items()}))
+
     for row in sheet_b.to_dict("records"):
-        text = f"{row['transaction_id']} from {row['sheet']} row {row['row_number']}: date {row['date']}, reference {row['reference']}, party {row['counterparty'] or row['description']}, amount {row['amount']}, direction {row['direction']}."
-        docs.append(Document(page_content=text, metadata=row))
-        
+        docs.append(Document(page_content=_row_chunk_text(row), metadata={k: str(v) for k, v in row.items()}))
+
     for kind in ["matched", "mismatched", "missing_in_a", "missing_in_b", "suspicious"]:
         for item in reconciliation[kind]:
-            text = f"{kind} findings: {str(item)}"
-            metadata = {"kind": kind}
-            # Handle list attributes mapping issue in Langchain metadata by stringifying dictionary values
-            metadata.update({k: str(v) for k, v in item.items()})
-            docs.append(Document(page_content=text, metadata=metadata))
-            
-    summary_text = f"summary findings: {str(reconciliation['summary'])}"
+            metadata = {"kind": kind, **{k: str(v) for k, v in item.items()}}
+            docs.append(Document(page_content=_finding_chunk_text(kind, item), metadata=metadata))
+
+    summary = reconciliation["summary"]
+    summary_text = (
+        "Status: Reconciliation summary\n"
+        f"Matched count: {summary['matched_count']}\n"
+        f"Mismatched count: {summary['mismatched_count']}\n"
+        f"Missing in A: {summary['missing_in_a_count']}\n"
+        f"Missing in B: {summary['missing_in_b_count']}\n"
+        f"Manual review count: {summary['manual_review_count']}\n"
+        f"Sheet A net: {summary['sheet_a']['net']}\n"
+        f"Sheet B net: {summary['sheet_b']['net']}\n"
+        f"Net variance: {summary['net_variance']}"
+    )
     docs.append(Document(page_content=summary_text, metadata={"kind": "summary"}))
     return docs
 
-def initialize_vector_store(api_key: str, docs: list[Document]):
-    embeddings = GoogleGenerativeAIEmbeddings(model="text-embedding-004", google_api_key=api_key)
-    vectorstore = FAISS.from_documents(docs, embeddings)
-    return vectorstore
 
-def ask_rag_agent(question: str, vectorstore: FAISS, api_key: str):
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=api_key)
+def _format_retrieved_docs(docs: list[Document]) -> str:
+    return "\n\n---\n\n".join(doc.page_content for doc in docs)
+
+
+def initialize_vector_store(api_key: str, docs: list[Document]) -> FAISS:
+    if not docs:
+        raise ValueError("No documents to index. Chunking produced zero documents.")
+    embeddings = GoogleGenerativeAIEmbeddings(
+        model="models/embedding-001",
+        google_api_key=api_key,
+        task_type="RETRIEVAL_DOCUMENT",
+    )
+    return FAISS.from_documents(docs, embeddings)
+
+
+def ask_rag_agent(question: str, vectorstore: FAISS, api_key: str) -> str:
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=api_key, temperature=0.2)
     retriever = vectorstore.as_retriever(search_kwargs={"k": 8})
-    
-    template = """
-    You are a financial transaction reconciliation assistant.
-    Answer using only the evidence below. Cite transaction IDs or row numbers whenever possible.
-    If evidence is insufficient, say what needs manual review.
-    
-    Question: {question}
-    Evidence: {context}
-    
-    Answer:
-    """
+
+    template = """You are a financial transaction reconciliation assistant.
+Answer using ONLY the evidence below. Always cite Transaction IDs and Row numbers.
+If the evidence is insufficient, say what needs manual review.
+
+Question: {question}
+
+Evidence:
+{context}
+
+Answer:"""
     prompt = PromptTemplate.from_template(template)
-    
+
     chain = (
-        {"context": retriever, "question": RunnablePassthrough()}
+        {"context": retriever | _format_retrieved_docs, "question": RunnablePassthrough()}
         | prompt
         | llm
         | StrOutputParser()
     )
-    
     return chain.invoke(question)
 
 
@@ -371,6 +445,8 @@ def main():
         st.session_state.reconciliation = None
     if "vectorstore" not in st.session_state:
         st.session_state.vectorstore = None
+    if "vector_store" not in st.session_state:
+        st.session_state.vector_store = None
 
     if reconcile_btn:
         if not file_a or not file_b:
@@ -385,14 +461,28 @@ def main():
                 sheet_a = load_sheet(file_a, "Sheet A")
                 sheet_b = load_sheet(file_b, "Sheet B")
                 recon_results = reconcile(sheet_a, sheet_b)
-                st.session_state.reconciliation = recon_results
-                
-                # Build RAG
+
                 docs = build_langchain_documents(sheet_a, sheet_b, recon_results)
+                st.write(f"RAG documents prepared: {len(docs)}")
+
                 vectorstore = initialize_vector_store(api_key, docs)
+                st.write("FAISS created successfully")
+
+                sample_hits = vectorstore.similarity_search("missing transactions", k=3)
+                with st.expander("RAG retrieval check (sample)", expanded=False):
+                    st.write(sample_hits)
+
+                st.session_state.reconciliation = recon_results
                 st.session_state.vectorstore = vectorstore
-                st.success("Reconciliation complete and RAG index built!")
+                st.session_state.vector_store = vectorstore
+                st.success(
+                    f"Reconciliation complete. Indexed {len(docs)} chunks; "
+                    f"retriever returned {len(sample_hits)} sample hits."
+                )
             except Exception as e:
+                st.session_state.reconciliation = None
+                st.session_state.vectorstore = None
+                st.session_state.vector_store = None
                 st.error(f"Error during reconciliation: {e}")
                 
     if st.session_state.reconciliation:
@@ -414,14 +504,15 @@ def main():
         
         if question:
             st.chat_message("user").write(question)
-            if not st.session_state.vectorstore:
-                st.error("Vector store not initialized.")
+            vectorstore = st.session_state.vectorstore or st.session_state.get("vector_store")
+            if not vectorstore:
+                st.error("Vector store not initialized. Click Reconcile Sheets after entering your API key.")
             elif not api_key:
                 st.error("Gemini API key is required to query the agent.")
             else:
                 with st.spinner("Consulting the agent..."):
                     try:
-                        answer = ask_rag_agent(question, st.session_state.vectorstore, api_key)
+                        answer = ask_rag_agent(question, vectorstore, api_key)
                         st.chat_message("assistant").write(answer)
                     except Exception as e:
                         st.error(f"Error generating answer: {str(e)}")
